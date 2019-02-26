@@ -80,3 +80,7 @@ obj-$(CONFIG_MSF2) += msf2-sysreg.o
 obj-$(CONFIG_NRF51_SOC) += nrf51_rng.o
 
 pcie-ebpf.o-libs   := -lubpf
+ifeq ($(CONFIG_LIBROCKSDB), y)
+	# TODO: Are all the following libraries really necessary?
+	pcie-ebpf.o-libs += -lrocksdb -lpthread -lrt -lsnappy -lz -lbz2 -llz4 -lzstd -lnuma -ltbb -lm
+endif
