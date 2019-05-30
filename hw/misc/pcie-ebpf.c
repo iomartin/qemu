@@ -1,6 +1,8 @@
 /*
  * QEMU BPF-capable PCI device
+ * Copyright (c) 2019 Martin Ichilevici de Oliveira
  *
+ * Inspired by QEMU educational PCI device
  * Copyright (c) 2012-2015 Jiri Slaby
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -35,21 +37,22 @@
 #define TYPE_PCI_BPF_DEVICE "pcie-ubpf"
 #define BPF(obj)        OBJECT_CHECK(BpfState, obj, TYPE_PCI_BPF_DEVICE)
 
-#define FACT_IRQ        0x00000001
-#define DMA_IRQ         0x00000100
-
-#define DMA_START       0x40000
 #define DMA_SIZE        4096
 
-#define EBPF_TEXT_LEN_OFFSET    0x0
-#define EBPF_MEM_LEN_OFFSET     0x4
-#define EBPF_TEXT_OFFSET        0x1000
+#define EBPF_OPCODE_OFFSET      0x0
+#define EBPF_CTRL_OFFSET        0x1
+#define EBPF_LENGTH_OFFSET      0x4
+#define EBPF_OFFSET_OFFSET      0x8
+#define EBPF_ADDR_OFFSET        0xc
+
+#define EBPF_TEXT_LEN_OFFSET    0x100000
+#define EBPF_MEM_LEN_OFFSET     0x100004
+#define EBPF_TEXT_OFFSET        0x100100
 #define EBPF_RET_OFFSET         0x200000
 #define EBPF_READY_OFFSET       0x200004
 #define EBPF_REGS_OFFSET        0x200008
 #define EBPF_MEM_OFFSET         0x400000
 #define EBPF_P2P_OFFSET         0x800000
-#define EBPF_START              0x1
 
 #define EBPF_OFFLOAD_OPCODE_DMA_TEXT      0x00
 #define EBPF_OFFLOAD_OPCODE_MOVE_P2P_TEXT 0x01
@@ -67,7 +70,7 @@
 #define EBPF_RAM_SIZE           EBPF_BAR_SIZE
 #define EBPF_MMIO_SIZE          (1 * MiB)
 #define EBPF_RAM_OFFSET         (0x0)
-#define EBPF_MMIO_OFFSET        (1 * MiB)
+#define EBPF_MMIO_OFFSET        (0 * MiB)
 
 typedef struct {
     PCIDevice pdev;
@@ -82,13 +85,8 @@ typedef struct {
     QemuCond thr_cond;
     bool stopping;
 
-    uint32_t addr4;
-    uint32_t fact;
 #define BPF_STATUS_COMPUTING    0x01
-#define BPF_STATUS_IRQFACT      0x80
     uint32_t status;
-
-    uint32_t irq_status;
 
     struct command {
         uint8_t opcode;
@@ -155,7 +153,7 @@ static void hexDump (const char *desc, void *addr, int len)
     printf ("  %s\n", buff);
 }
 
-
+/* Execute the eBPF program */
 static int bpf_start_program(BpfState *bpf)
 {
     char *bpf_ram_ptr = (char*) memory_region_get_ram_ptr(&bpf->bpf_ram);
@@ -172,6 +170,7 @@ static int bpf_start_program(BpfState *bpf)
     uint64_t ret;
     bool elf;
 
+    /* This address is checked by the host to see if execution has finished */
     *ready_addr = EBPF_NOT_READY;
 
     bpf->vm = ubpf_create();
@@ -180,7 +179,7 @@ static int bpf_start_program(BpfState *bpf)
         return 1;
     }
 
-    /* Check magic number (first 4 bytes) */
+    /* Check magic number (first 4 bytes), to check if program is in ELF format or not */
     elf = code_len >= 4 && !memcmp(code, ELFMAG, 4);
     if (elf) {
         rv = ubpf_load_elf(bpf->vm, code, code_len, &errmsg);
@@ -214,6 +213,7 @@ static int bpf_start_program(BpfState *bpf)
     return 0;
 }
 
+/*
 static int bpf_stop_program(BpfState *bpf)
 {
     if (bpf->vm) {
@@ -222,36 +222,11 @@ static int bpf_stop_program(BpfState *bpf)
     }
     return 0;
 }
+*/
 
-static uint64_t bpf_mmio_read(void *opaque, hwaddr addr, unsigned size)
-{
-    BpfState *bpf = opaque;
-    uint64_t val = ~0ULL;
-
-    switch (addr) {
-    case 0x0:
-        val = bpf->cmd.opcode;
-        break;
-    case 0x1:
-        val = bpf->cmd.ctrl;
-        break;
-    case 0x4:
-        val = bpf->cmd.length;
-        break;
-    case 0x8:
-        val = bpf->cmd.offset;
-        break;
-    case 0xc:
-        val = bpf->cmd.addr;
-        break;
-    default:
-        //fprintf(stderr, "Invalid read (reserved)\n");
-        break;
-    }
-
-    return val;
-}
-
+/* Copy data to the .text segment. If inp2p is true, then we copy from the
+ * p2pdma area. Otherwise, use DMA to copy from the host.
+ */
 static void load_text(BpfState *bpf, bool inp2p)
 {
     char *bpf_ram_ptr = (char*) memory_region_get_ram_ptr(&bpf->bpf_ram);
@@ -270,6 +245,9 @@ static void load_text(BpfState *bpf, bool inp2p)
     atomic_or(&bpf->cmd.ctrl, DMA_DONE);
 }
 
+/* Copy data to the .data segment. If inp2p is true, then we copy from the
+ * p2pdma area. Otherwise, use DMA to copy from the host.
+ */
 static void load_data(BpfState *bpf, bool inp2p)
 {
     char *bpf_ram_ptr = (char*) memory_region_get_ram_ptr(&bpf->bpf_ram);
@@ -288,12 +266,15 @@ static void load_data(BpfState *bpf, bool inp2p)
     atomic_or(&bpf->cmd.ctrl, DMA_DONE);
 }
 
-static void run_program(BpfState *bpf)
+static inline void run_program(BpfState *bpf)
 {
-    bpf_stop_program(bpf);
+    //bpf_stop_program(bpf);
     bpf_start_program(bpf);
 }
 
+/* Useful for debugging. Print both the .text and the .data segments to
+ * screen (note it is not transferred to the host).
+ */
 static void dump_memory(BpfState *bpf)
 {
     char *bpf_ram_ptr = (char*) memory_region_get_ram_ptr(&bpf->bpf_ram);
@@ -312,7 +293,7 @@ static void process_command(BpfState *bpf)
     switch (bpf->cmd.opcode) {
         case EBPF_OFFLOAD_OPCODE_DMA_TEXT:
         case EBPF_OFFLOAD_OPCODE_MOVE_P2P_TEXT:
-            load_text(bpf, bpf->cmd.opcode); break;
+            load_text(bpf, bpf->cmd.opcode == EBPF_OFFLOAD_OPCODE_MOVE_P2P_TEXT); break;
         case EBPF_OFFLOAD_OPCODE_DMA_DATA:
         case EBPF_OFFLOAD_OPCODE_MOVE_P2P_DATA:
             load_data(bpf, bpf->cmd.opcode == EBPF_OFFLOAD_OPCODE_MOVE_P2P_DATA); break;
@@ -325,10 +306,39 @@ static void process_command(BpfState *bpf)
     }
 }
 
-static void check_size(const char *name, unsigned expected, unsigned received)
+static inline void check_size(const char *name, unsigned expected, unsigned received)
 {
     if (expected != received)
         fprintf(stderr, "WARNING: %s should have size %u, received %u instead\n", name, expected, received);
+}
+
+static uint64_t bpf_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    BpfState *bpf = opaque;
+    uint64_t val = ~0ULL;
+
+    switch (addr) {
+    case EBPF_OPCODE_OFFSET:
+        val = bpf->cmd.opcode;
+        break;
+    case EBPF_CTRL_OFFSET:
+        val = bpf->cmd.ctrl;
+        break;
+    case EBPF_LENGTH_OFFSET:
+        val = bpf->cmd.length;
+        break;
+    case EBPF_OFFSET_OFFSET:
+        val = bpf->cmd.offset;
+        break;
+    case EBPF_ADDR_OFFSET:
+        val = bpf->cmd.addr;
+        break;
+    default:
+        //fprintf(stderr, "Invalid read (reserved)\n");
+        break;
+    }
+
+    return val;
 }
 
 static void bpf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
@@ -340,11 +350,11 @@ static void bpf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         size, addr, val);
 
     switch (addr & 0xff) {
-        case 0x0:
+        case EBPF_OPCODE_OFFSET:
             check_size("opcode", 1, size);
             bpf->cmd.opcode = val & 0xff;
             break;
-        case 0x1:
+        case EBPF_CTRL_OFFSET:
             check_size("ctrl", 1, size);
             bpf->cmd.ctrl = val & 0xff;
             qemu_mutex_lock(&bpf->thr_mutex);
@@ -352,15 +362,15 @@ static void bpf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             qemu_cond_signal(&bpf->thr_cond);
             qemu_mutex_unlock(&bpf->thr_mutex);
             break;
-        case 0x4:
+        case EBPF_LENGTH_OFFSET:
             check_size("length", 4, size);
             bpf->cmd.length = val & 0xffffffff;
             break;
-        case 0x8:
+        case EBPF_OFFSET_OFFSET:
             check_size("offset", 4, size);
             bpf->cmd.offset = val & 0xffffffff;
             break;
-        case 0xc:
+        case EBPF_ADDR_OFFSET:
             check_size("addr", 8, size);
             bpf->cmd.addr = val;
             break;
