@@ -195,8 +195,9 @@ static int bpf_start_program(BpfState *bpf)
     ubpf_register(bpf->vm, 5, "CreateSSTUtils", CreateSSTUtils);
     ubpf_register(bpf->vm, 6, "Init", Init);
     ubpf_register(bpf->vm, 7, "Find", Find);
-    ubpf_register(bpf->vm, 8, "AddFile", AddFile);
-    ubpf_register(bpf->vm, 9, "Close", Close);
+    ubpf_register(bpf->vm, 8, "AddSSTFile", AddSSTFile);
+    ubpf_register(bpf->vm, 9, "CloseSSTUtils", CloseSSTUtils);
+    ubpf_register(bpf->vm, 10, "OffloadCompact", OffloadCompact);
 #endif
     if (!bpf->vm) {
         fprintf(stderr, "Failed to create VM\n");
